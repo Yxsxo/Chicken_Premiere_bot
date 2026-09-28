@@ -127,12 +127,16 @@ def format_meal_detail(meal, items=None):
 
 
 def progress_bar(value, goal, width=10):
-    """██████░░░░ — сколько от цели уже набрано."""
+    """🟩🟩🟩⬜⬜ — сколько от цели уже набрано; при переборе вся полоска красная.
+    Эмодзи, а не █░: символы-блоки на iPhone рисуются разной ширины."""
     if not goal:
         return ""
 
+    if value > goal:
+        return "🟥" * width
+
     filled = min(width, round(value / goal * width))
-    return "█" * filled + "░" * (width - filled)
+    return "🟩" * filled + "⬜" * (width - filled)
 
 
 def format_day_summary(totals, daily_goal, protein_goal=None):
