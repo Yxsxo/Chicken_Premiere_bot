@@ -1,9 +1,12 @@
 import os
 import json
+import base64
 import logging
 
 import anthropic
 from dotenv import load_dotenv
+
+import nutrition
 
 load_dotenv()
 
@@ -17,11 +20,11 @@ client = anthropic.Anthropic(
 
 MODEL = "claude-haiku-4-5-20251001"
 
-SYSTEM_PROMPT = """Ты — помощник по подсчёту калорий. Пользователь пишет тебе, что он съел, обычным языком на русском.
+SYSTEM_PROMPT = """Ты — помощник по подсчёту калорий. Пользователь пишет тебе, что он съел, обычным языком на русском, или присылает фото еды.
 
 Твоя задача:
-1. Разбить сообщение на отдельные продукты/блюда.
-2. Определить вес порции каждого продукта в граммах.
+1. Разбить сообщение (или то, что на фото) на отдельные продукты/блюда.
+2. Определить вес порции каждого продукта в граммах. По фото оценивай размер порции по тарелке, приборам и другим предметам рядом.
 3. Для каждого продукта также указать "quantity" — количество так, как человек написал бы его естественно: для штучных продуктов (яйца, бутерброды, бананы, котлеты и т.п.) — в штуках, например "4 шт"; для остального (рис, мясо порцией, салат и т.п.) — в граммах, например "180 г".
 4. Посчитать калории и БЖУ (белки, жиры, углеводы) для каждого продукта.
 
@@ -34,7 +37,7 @@ SYSTEM_PROMPT = """Ты — помощник по подсчёту калори�
 }
 
 "grams" — это всегда вес в граммах числом (используется для расчётов), а "quantity" — то же самое количество, но по-человечески (штуки или граммы текстом). Все числа — целые или с одним знаком после запятой.
-Если в сообщении нет еды или напитков, верни {"items": []}.
+Если в сообщении или на фото нет еды или напитков, верни {"items": []}.
 Никакого текста, кроме этого JSON, в ответе быть не должно."""
 
 
@@ -89,35 +92,17 @@ def _parse_result(raw_text):
         return None
 
     # Итоги считаем сами из продуктов: модель иногда ошибается в сложении
-    return {
-        "items": items,
-        "total_kcal": sum(item["kcal"] for item in items),
-        "total_protein": round(sum(item["protein"] for item in items), 1),
-        "total_fat": round(sum(item["fat"] for item in items), 1),
-        "total_carbs": round(sum(item["carbs"] for item in items), 1),
-    }
+    return nutrition.make_result(items)
 
 
-def analyze_food(food_text, grams_text=None):
-    """Разбирает еду. Возвращает dict или None (не похоже на еду).
-    Если LLM недоступен — бросает LLMUnavailableError."""
-    if grams_text:
-        user_message = (
-            f"Продукты: {food_text}\n"
-            f"Пользователь указал точный вес порций: {grams_text}\n\n"
-            "Используй именно эти граммы, не меняй и не оценивай их заново — "
-            "только посчитай калории и БЖУ по указанному весу. "
-            "В поле quantity в этом случае укажи граммы, которые дал пользователь."
-        )
-    else:
-        user_message = food_text
-
+def _ask(content):
+    """Отправляет сообщение модели и разбирает ответ. content — текст или список блоков."""
     try:
         response = client.messages.create(
             model=MODEL,
             max_tokens=1000,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[{"role": "user", "content": content}],
         )
     except anthropic.AnthropicError as error:
         logger.warning("LLM недоступен: %s: %s", type(error).__name__, error)
@@ -130,3 +115,49 @@ def analyze_food(food_text, grams_text=None):
         logger.info("Не удалось разобрать ответ LLM: %r", raw_text[:500])
 
     return result
+
+
+def analyze_food(food_text, grams_text=None, image_bytes=None):
+    """Разбирает еду по тексту и/или фото. Возвращает dict или None (не похоже на еду).
+    Если LLM недоступен — бросает LLMUnavailableError."""
+    if image_bytes is not None:
+        caption = (
+            f"Подпись к фото: {food_text}" if food_text else "Что за еда на фото?"
+        )
+        # Картинку передаём прямо в запросе, закодированной в base64
+        return _ask(
+            [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",  # Telegram присылает фото в JPEG
+                        "data": base64.b64encode(image_bytes).decode("ascii"),
+                    },
+                },
+                {"type": "text", "text": caption},
+            ]
+        )
+
+    if grams_text:
+        return _ask(
+            f"Продукты: {food_text}\n"
+            f"Пользователь указал точный вес порций: {grams_text}\n\n"
+            "Используй именно эти граммы, не меняй и не оценивай их заново — "
+            "только посчитай калории и БЖУ по указанному весу. "
+            "В поле quantity в этом случае укажи граммы, которые дал пользователь."
+        )
+
+    return _ask(food_text)
+
+
+def correct_result(result, correction_text):
+    """Правка готового разбора словами: «рыбы было 200 г, хлеба не было»."""
+    current_items = json.dumps(result["items"], ensure_ascii=False)
+
+    return _ask(
+        f"Вот текущий разбор приёма пищи:\n{current_items}\n\n"
+        f"Пользователь поправляет: {correction_text}\n\n"
+        "Внеси эти исправления и верни ПОЛНЫЙ список продуктов в том же JSON-формате. "
+        "Продукты, которые пользователь не упоминал, оставь без изменений."
+    )

@@ -15,6 +15,14 @@ GOAL_MULTIPLIERS = {
 }
 
 
+# Граммы белка на кг веса: при похудении и наборе белка нужно больше
+PROTEIN_PER_KG = {
+    "lose": 1.8,
+    "maintain": 1.4,
+    "gain": 1.8,
+}
+
+
 def calculate_bmr(weight_kg, height_cm, age, gender):
     """Базовый обмен веществ, формула Миффлина - Сан Жеора."""
     if gender == GENDER_MALE:
@@ -28,3 +36,7 @@ def calculate_daily_goal(weight_kg, height_cm, age, gender, activity, goal):
     tdee = bmr * ACTIVITY_MULTIPLIERS[activity]
     target = tdee * GOAL_MULTIPLIERS[goal]
     return round(target / 10) * 10  # округляем до десятков
+
+
+def calculate_protein_goal(weight_kg, goal):
+    return round(weight_kg * PROTEIN_PER_KG[goal] / 5) * 5  # округляем до 5 г

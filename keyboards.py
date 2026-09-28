@@ -1,33 +1,81 @@
 from telebot import types
 
+import formatting
 from db import MEAL_TYPE_CODES
 
 
-def portion_choice_keyboard():
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton("⚖️ Я укажу граммы", callback_data="portion_grams"),
-        types.InlineKeyboardButton("🤖 Оцени сам", callback_data="portion_estimate"),
-    )
-    return keyboard
-
-
-def confirm_keyboard():
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton("✅ Записать", callback_data="confirm_save"),
-        types.InlineKeyboardButton("✏️ Исправить", callback_data="confirm_edit"),
-        types.InlineKeyboardButton("❌ Отмена", callback_data="confirm_cancel"),
-    )
-    return keyboard
+def _button(text, callback_data):
+    return types.InlineKeyboardButton(text, callback_data=callback_data)
 
 
 def main_menu_keyboard():
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.row("📊 Сегодня", "📜 История")
-    keyboard.row("⚖️ Вес", "📈 Отчёт")
-    keyboard.row("⚙️ Настройки")
+    keyboard.row("🔁 Повторить", "⚖️ Вес")
+    keyboard.row("📈 Отчёт", "⚙️ Настройки")
     return keyboard
+
+
+# =========================
+# НОВАЯ ЗАПИСЬ И РЕДАКТОР
+# =========================
+
+
+def portion_choice_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        _button("⚖️ Я укажу граммы", "portion_grams"),
+        _button("🤖 Оцени сам", "portion_estimate"),
+    )
+    return keyboard
+
+
+def confirm_keyboard(save_label="✅ Записать"):
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        _button(save_label, "confirm_save"),
+        _button("✏️ Исправить", "confirm_edit"),
+        _button("❌ Отмена", "confirm_cancel"),
+    )
+    return keyboard
+
+
+def editor_keyboard(items, save_label="✅ Записать"):
+    """Каждый продукт — кнопка. Нажал — можно изменить вес или убрать."""
+    keyboard = types.InlineKeyboardMarkup()
+
+    for index, item in enumerate(items):
+        keyboard.add(_button(formatting.format_item_line(item), f"edit_item_{index}"))
+
+    keyboard.add(_button("➕ Добавить продукт", "edit_add"))
+
+    buttons = [_button("❌ Отмена", "confirm_cancel")]
+    if items:
+        buttons.insert(0, _button(save_label, "confirm_save"))
+    keyboard.add(*buttons)
+
+    return keyboard
+
+
+def item_actions_keyboard(index):
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        _button("⚖️ Изменить вес", f"edit_grams_{index}"),
+        _button("🗑 Убрать", f"edit_remove_{index}"),
+    )
+    keyboard.add(_button("« Назад", "edit_back"))
+    return keyboard
+
+
+def editor_back_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(_button("« Назад", "edit_back"))
+    return keyboard
+
+
+# =========================
+# ИСТОРИЯ И ПОВТОР
+# =========================
 
 
 def history_list_keyboard(meals):
@@ -37,59 +85,92 @@ def history_list_keyboard(meals):
         label_time = time or "--:--"
         label_desc = (description or "запись")[:22]
         keyboard.add(
-            types.InlineKeyboardButton(
-                f"{label_time} · {label_desc} · {calories} ккал",
-                callback_data=f"histopen_{meal_id}",
+            _button(
+                f"{label_time} · {label_desc} · {calories} ккал", f"histopen_{meal_id}"
             )
         )
 
     return keyboard
 
 
-def history_item_keyboard(meal_id):
+def history_item_keyboard(meal_id, has_items):
+    keyboard = types.InlineKeyboardMarkup()
+
+    if has_items:
+        keyboard.add(_button("✏️ Изменить состав", f"histedit_{meal_id}"))
+
+    keyboard.add(
+        _button("🔄 Приём пищи", f"histtype_{meal_id}"),
+        _button("🔁 Ещё раз сегодня", f"repeat_{meal_id}"),
+    )
+    keyboard.add(
+        _button("🗑 Удалить", f"histdel_{meal_id}"),
+        _button("« К списку", "histlist"),
+    )
+    return keyboard
+
+
+def delete_confirm_keyboard(meal_id):
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
-        types.InlineKeyboardButton(
-            "🔄 Приём пищи", callback_data=f"histtype_{meal_id}"
-        ),
-        types.InlineKeyboardButton("🗑 Удалить", callback_data=f"histdel_{meal_id}"),
+        _button("🗑 Да, удалить", f"histdelok_{meal_id}"),
+        _button("Отмена", f"histback_{meal_id}"),
     )
-    keyboard.add(types.InlineKeyboardButton("« К списку", callback_data="histlist"))
     return keyboard
 
 
 def meal_type_choice_keyboard(meal_id):
     keyboard = types.InlineKeyboardMarkup()
     buttons = [
-        types.InlineKeyboardButton(
-            label.capitalize(), callback_data=f"settype_{meal_id}_{code}"
-        )
+        _button(label.capitalize(), f"settype_{meal_id}_{code}")
         for code, label in MEAL_TYPE_CODES.items()
     ]
     keyboard.add(*buttons)
-    keyboard.add(
-        types.InlineKeyboardButton("« Назад", callback_data=f"histback_{meal_id}")
-    )
+    keyboard.add(_button("« Назад", f"histback_{meal_id}"))
+    return keyboard
+
+
+def repeat_list_keyboard(meals):
+    keyboard = types.InlineKeyboardMarkup()
+
+    for meal_id, description, calories in meals:
+        keyboard.add(_button(f"{description[:40]} · {calories} ккал", f"repeat_{meal_id}"))
+
+    return keyboard
+
+
+def undo_keyboard(meal_id):
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(_button("↩️ Отменить", f"undo_{meal_id}"))
+    return keyboard
+
+
+# =========================
+# ВЕС И ОТЧЁТЫ
+# =========================
+
+
+def weight_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(_button("📈 График веса", "weight_chart"))
     return keyboard
 
 
 def report_period_keyboard():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
-        types.InlineKeyboardButton("Неделя", callback_data="reportperiod_week"),
-        types.InlineKeyboardButton("Месяц", callback_data="reportperiod_month"),
+        _button("Неделя", "reportperiod_week"),
+        _button("Месяц", "reportperiod_month"),
     )
-    keyboard.add(
-        types.InlineKeyboardButton("Свой период", callback_data="reportperiod_custom")
-    )
+    keyboard.add(_button("Свой период", "reportperiod_custom"))
     return keyboard
 
 
 def report_format_keyboard():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
-        types.InlineKeyboardButton("📝 Текст", callback_data="reportformat_text"),
-        types.InlineKeyboardButton("🖼 Картинка", callback_data="reportformat_image"),
+        _button("📝 Текст", "reportformat_text"),
+        _button("🖼 Картинка", "reportformat_image"),
     )
     return keyboard
 
@@ -101,75 +182,45 @@ def report_format_keyboard():
 
 def settings_menu_keyboard():
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton(
-            "⏰ Время напоминания", callback_data="settings_reminder"
-        )
-    )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            "🎯 Дневная цель калорий", callback_data="settings_goal"
-        )
-    )
+    keyboard.add(_button("⏰ Время напоминания", "settings_reminder"))
+    keyboard.add(_button("🎯 Дневная цель калорий", "settings_goal"))
+    keyboard.add(_button("🥩 Цель по белку", "settings_protein"))
     return keyboard
 
 
 def goal_mode_keyboard():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
-        types.InlineKeyboardButton("✍️ Введу сам", callback_data="goalmode_manual"),
-        types.InlineKeyboardButton("🧮 Рассчитать", callback_data="goalmode_calc"),
+        _button("✍️ Введу сам", "goalmode_manual"),
+        _button("🧮 Рассчитать", "goalmode_calc"),
     )
-    keyboard.add(types.InlineKeyboardButton("« Назад", callback_data="settings_back"))
+    keyboard.add(_button("« Назад", "settings_back"))
     return keyboard
 
 
 def gender_keyboard():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
-        types.InlineKeyboardButton("Мужской", callback_data="gender_male"),
-        types.InlineKeyboardButton("Женский", callback_data="gender_female"),
+        _button("Мужской", "gender_male"),
+        _button("Женский", "gender_female"),
     )
     return keyboard
 
 
 def activity_keyboard():
     keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(_button("Низкая — мало или нет спорта", "activity_low"))
+    keyboard.add(_button("Средняя — тренировки 1-3 раза в неделю", "activity_medium"))
+    keyboard.add(_button("Высокая — тренировки 4-5 раз в неделю", "activity_high"))
     keyboard.add(
-        types.InlineKeyboardButton(
-            "Низкая — мало или нет спорта", callback_data="activity_low"
-        )
-    )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            "Средняя — тренировки 1-3 раза в неделю", callback_data="activity_medium"
-        )
-    )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            "Высокая — тренировки 4-5 раз в неделю", callback_data="activity_high"
-        )
-    )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            "Очень высокая — спорт почти каждый день",
-            callback_data="activity_very_high",
-        )
+        _button("Очень высокая — спорт почти каждый день", "activity_very_high")
     )
     return keyboard
 
 
 def goal_type_keyboard():
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton("📉 Похудение", callback_data="goaltype_lose")
-    )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            "⚖️ Удержание веса", callback_data="goaltype_maintain"
-        )
-    )
-    keyboard.add(
-        types.InlineKeyboardButton("📈 Массонабор", callback_data="goaltype_gain")
-    )
+    keyboard.add(_button("📉 Похудение", "goaltype_lose"))
+    keyboard.add(_button("⚖️ Удержание веса", "goaltype_maintain"))
+    keyboard.add(_button("📈 Массонабор", "goaltype_gain"))
     return keyboard

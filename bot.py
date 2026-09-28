@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
 import telebot
+from telebot.apihelper import ApiTelegramException
 from dotenv import load_dotenv
 
 import db
@@ -13,6 +14,7 @@ import state
 import reports
 import reminders
 import formatting
+import nutrition
 import calc
 import clock
 
@@ -59,23 +61,31 @@ if TOKEN is None:
 
 bot = telebot.TeleBot(TOKEN, exception_handler=LogExceptionHandler())
 
-MEAL_TYPE_EMOJI = {
-    "завтрак": "🍳",
-    "обед": "🍲",
-    "ужин": "🍽",
-    "перекус": "🍎",
-}
-
-MEAL_TYPE_ORDER = ["завтрак", "обед", "ужин", "перекус"]
-
 LLM_UNAVAILABLE_TEXT = (
     "😔 Сервис подсчёта сейчас не отвечает. Попробуй ещё раз через минуту."
 )
 
-STATE_LOST_TEXT = (
-    "Я потерял твоё сообщение (возможно, бот перезапускался) 🤷\n"
-    "Напиши заново, что ты съел."
+NOT_FOOD_TEXT = "Не получилось разобрать это как еду 🤔 Попробуй переформулировать."
+
+# Заголовок черновика зависит от того, откуда пришёл результат
+DRAFT_HEADERS = {
+    "estimate": "🤖 Я оценил порцию так:",
+    "grams": "🍽 Вот что получилось:",
+    "photo": "📷 Вот что я вижу на фото:",
+}
+
+EDITOR_HINT = (
+    "✏️ Нажми на продукт, чтобы изменить вес или убрать его.\n"
+    "Или напиши исправление словами: «рыбы было 200 г, хлеба не было»."
 )
+
+# Кнопки, которые относятся к черновику приёма пищи
+DRAFT_CALLBACK_PREFIXES = ("portion_", "confirm_", "edit_")
+
+
+# =========================
+# ОБЩИЕ ПОМОЩНИКИ
+# =========================
 
 
 def ensure_registered(user_id, chat_id):
@@ -97,97 +107,308 @@ def parse_number(text, min_value, max_value):
     return value
 
 
-# =========================
-# ФОРМАТИРОВАНИЕ
-# =========================
+def edit(chat_id, message_id, text, reply_markup=None):
+    """edit_message_text, который не падает, если текст и кнопки не изменились."""
+    try:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
+    except ApiTelegramException as error:
+        if "message is not modified" not in str(error):
+            raise
 
 
-def format_food_result(data, estimated, meal_type_label=None):
-    header = "🤖 Я оценил порцию так:\n" if estimated else "🍽 Вот что получилось:\n"
-    lines = [header]
+def remove_keyboard(chat_id, message_id):
+    """Убирает кнопки у сообщения. Если не вышло (кнопок уже нет) — не страшно."""
+    if message_id is None:
+        return
 
-    for item in data["items"]:
-        lines.append(f"{item['name']} — {item['grams']} г — {item['kcal']} ккал")
-
-    lines.append(
-        f"\n≈ {data['total_kcal']} ккал"
-        f"\nБ: {data['total_protein']} г"
-        f"\nЖ: {data['total_fat']} г"
-        f"\nУ: {data['total_carbs']} г"
-    )
-
-    if meal_type_label:
-        lines.append(f"\n🍽 Приём пищи: {meal_type_label} (указано вами)")
-
-    return "\n".join(lines)
+    try:
+        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+    except ApiTelegramException:
+        pass
 
 
-def build_description(data):
-    parts = [f"{item['name']} {item['quantity']}" for item in data["items"]]
-    return ", ".join(parts)
+def answer(call, text=None):
+    """Ответ на нажатие кнопки (убирает «часики»). Повторный ответ молча пропускаем."""
+    try:
+        bot.answer_callback_query(call.id, text)
+    except ApiTelegramException:
+        pass
 
 
-def format_meal_detail(meal):
-    meal_id, date, time, description, calories, meal_type = meal
-    emoji = MEAL_TYPE_EMOJI.get(meal_type, "❓")
-    time_str = time or "--:--"
-    desc = description or "Старая запись"
-    type_str = meal_type or "не указан"
-
-    return (
-        f"{emoji} {time_str}\n"
-        f"📅 {formatting.format_date_with_weekday(date)}\n"
-        f"{desc}\n"
-        f"{calories} ккал\n"
-        f"Приём пищи: {type_str}"
+def today_short_summary(user_id):
+    return formatting.format_short_summary(
+        db.get_today_totals(user_id), db.get_daily_goal(user_id)
     )
 
 
-def format_today_text(meals, total, remaining, daily_goal):
-    today_date_str = clock.today_str()
-    text = f"📊 {formatting.format_date_with_weekday(today_date_str)}:\n\n"
+# =========================
+# ЧЕРНОВИК ПРИЁМА ПИЩИ
+# =========================
+# Черновик — результат разбора еды, который ещё не записан.
+# Он живёт в состоянии: result (продукты и итоги), source (откуда пришёл),
+# explicit_meal_type, day_offset, editing_meal_id (если правим запись из истории)
+# и draft_message_id — сообщение, в котором сейчас показан черновик.
 
-    if not meals:
-        text += "Записей пока нет.\n"
+
+def draft_text(st, editing):
+    if editing:
+        header = EDITOR_HINT
+    elif st.get("editing_meal_id"):
+        header = "✏️ Изменение записи:"
     else:
-        grouped = {key: [] for key in MEAL_TYPE_ORDER}
-        unspecified = []
+        header = DRAFT_HEADERS.get(st.get("source"), DRAFT_HEADERS["grams"])
 
-        for meal_time, description, calories, meal_type in meals:
-            if description is None:
-                description = "Старая запись"
+    return formatting.format_food_result(
+        st["result"], header, st.get("explicit_meal_type"), st.get("day_offset", 0)
+    )
 
-            if meal_type in grouped:
-                grouped[meal_type].append((description, calories))
-            else:
-                unspecified.append((description, calories))
 
-        for meal_type in MEAL_TYPE_ORDER:
-            items = grouped[meal_type]
-            if not items:
-                continue
+def draft_keyboard(st, editing):
+    save_label = "💾 Сохранить" if st.get("editing_meal_id") else "✅ Записать"
 
-            emoji = MEAL_TYPE_EMOJI[meal_type]
-            text += f"{emoji} {meal_type.capitalize()}:\n"
+    if editing:
+        return keyboards.editor_keyboard(st["result"]["items"], save_label)
 
-            for description, calories in items:
-                text += f"— {description} — {calories} ккал\n"
+    return keyboards.confirm_keyboard(save_label)
 
-            text += "\n"
 
-        if unspecified:
-            text += "❓ Приём пищи не указан:\n"
-            for description, calories in unspecified:
-                text += f"— {description} — {calories} ккал\n"
-            text += "\n"
+def show_draft(chat_id, user_id, editing, message_id=None):
+    """Показывает черновик: результат с кнопками «Записать / Исправить» или редактор.
+    message_id — отредактировать это сообщение; иначе отправить новое внизу чата,
+    а у прошлого черновика убрать кнопки, чтобы их не нажали по ошибке."""
+    state.set_state(user_id, stage="editing" if editing else "waiting_confirmation")
+    st = state.get_state(user_id)
 
-    text += f"🔥 Всего: {total} / {daily_goal} ккал\n" f"🎯 Осталось: {remaining} ккал"
+    text = draft_text(st, editing)
+    keyboard = draft_keyboard(st, editing)
 
-    return text
+    if message_id is None:
+        remove_keyboard(chat_id, st.get("draft_message_id"))
+        message_id = bot.send_message(chat_id, text, reply_markup=keyboard).message_id
+    else:
+        edit(chat_id, message_id, text, keyboard)
+
+    state.set_state(user_id, draft_message_id=message_id)
+
+
+def update_draft_items(user_id, items):
+    state.set_state(user_id, result=nutrition.make_result(items))
+
+
+def save_draft(call, user_id, st):
+    result = st["result"]
+
+    if not result["items"]:
+        answer(call, "Список пуст — добавь продукт или отмени")
+        return
+
+    description = formatting.build_description(result)
+    meal_id = st.get("editing_meal_id")
+    day_offset = st.get("day_offset", 0)
+
+    if meal_id:
+        if db.update_meal(meal_id, user_id, description, result):
+            header = "✅ Запись обновлена!"
+        else:
+            header = "Запись не найдена — возможно, её уже удалили."
+    else:
+        db.add_meal(
+            user_id,
+            description,
+            result["total_kcal"],
+            protein=result["total_protein"],
+            fat=result["total_fat"],
+            carbs=result["total_carbs"],
+            meal_type=st.get("explicit_meal_type"),
+            items=result["items"],
+            day_offset=day_offset,
+        )
+        if day_offset:
+            header = f"✅ Записано на {formatting.format_day_offset(day_offset)}!"
+        else:
+            header = "✅ Записано!"
+
+    state.clear_state(user_id)
+    edit(
+        call.message.chat.id,
+        call.message.message_id,
+        f"{header}\n\n{today_short_summary(user_id)}",
+    )
+
+
+def estimate_portion(call, user_id, st):
+    """Кнопка «Оцени сам»: просим LLM оценить порции и показываем результат."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    edit(chat_id, message_id, "🤖 Считаю...")
+
+    try:
+        result = claude_client.analyze_food(st.get("food_text"))
+    except claude_client.LLMUnavailableError:
+        # Возвращаем кнопки, чтобы можно было нажать ещё раз
+        edit(
+            chat_id,
+            message_id,
+            LLM_UNAVAILABLE_TEXT,
+            keyboards.portion_choice_keyboard(),
+        )
+        return
+
+    if result is None:
+        state.clear_state(user_id)
+        edit(chat_id, message_id, NOT_FOOD_TEXT)
+        return
+
+    state.set_state(user_id, result=result, source="estimate")
+    show_draft(chat_id, user_id, editing=False, message_id=message_id)
+
+
+def handle_draft_callback(call, user_id, st, data):
+    """Кнопки черновика: выбор порции, записать / исправить / отмена, редактор."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    if data == "portion_grams":
+        state.set_state(user_id, stage="waiting_grams")
+        edit(
+            chat_id,
+            message_id,
+            "Напиши вес каждого продукта в граммах, например:\n"
+            "рис 180 г, курица 200 г, овощи 100 г",
+        )
+
+    elif data == "portion_estimate":
+        estimate_portion(call, user_id, st)
+
+    elif data == "confirm_save":
+        save_draft(call, user_id, st)
+
+    elif data == "confirm_edit" or data == "edit_back":
+        show_draft(chat_id, user_id, editing=True, message_id=message_id)
+
+    elif data == "confirm_cancel":
+        state.clear_state(user_id)
+        edit(chat_id, message_id, "❌ Отменено")
+
+    elif data == "edit_add":
+        state.set_state(user_id, stage="waiting_new_item")
+        edit(
+            chat_id,
+            message_id,
+            "Что добавить? Например: соус 30 г",
+            keyboards.editor_back_keyboard(),
+        )
+
+    elif data.startswith("edit_"):
+        # edit_item_2, edit_grams_2, edit_remove_2 — действие с продуктом №2
+        _, action, index_str = data.split("_")
+        index = int(index_str)
+        items = st["result"]["items"]
+
+        if index >= len(items):  # список успел измениться
+            show_draft(chat_id, user_id, editing=True, message_id=message_id)
+            return
+
+        item = items[index]
+
+        if action == "item":
+            edit(
+                chat_id,
+                message_id,
+                f"Что сделать с этим продуктом?\n\n{formatting.format_item_line(item)}",
+                keyboards.item_actions_keyboard(index),
+            )
+
+        elif action == "grams":
+            state.set_state(user_id, stage="waiting_item_grams", edit_index=index)
+            edit(
+                chat_id,
+                message_id,
+                f"Сколько граммов «{item['name']}»? Сейчас {item['grams']} г.\n"
+                "Напиши число, например: 200",
+                keyboards.editor_back_keyboard(),
+            )
+
+        elif action == "remove":
+            update_draft_items(user_id, items[:index] + items[index + 1 :])
+            show_draft(chat_id, user_id, editing=True, message_id=message_id)
+
+
+def handle_editor_text(message, user_id, st, stage, text):
+    """Текст, присланный в режиме редактора. True — если сообщение обработано здесь."""
+    if stage not in ("waiting_item_grams", "waiting_new_item", "editing"):
+        return False
+
+    items = st["result"]["items"]
+
+    if stage == "waiting_item_grams":
+        grams = parse_number(text, 1, 5000)
+        index = st.get("edit_index", 0)
+
+        if grams is None:
+            bot.reply_to(message, "Напиши вес числом в граммах, например: 200")
+            return True
+
+        if index < len(items):
+            items[index] = nutrition.scale_item(items[index], round(grams))
+            update_draft_items(user_id, items)
+
+        show_draft(message.chat.id, user_id, editing=True)
+        return True
+
+    bot.send_chat_action(message.chat.id, "typing")
+
+    try:
+        if stage == "waiting_new_item":
+            new_result = claude_client.analyze_food(text)
+        else:
+            # Исправление словами: «рыбы было 200 г, хлеба не было»
+            new_result = claude_client.correct_result(st["result"], text)
+    except claude_client.LLMUnavailableError:
+        bot.reply_to(message, LLM_UNAVAILABLE_TEXT)
+        return True
+
+    if new_result is None:
+        bot.reply_to(message, "Не понял 🤔 Попробуй написать иначе.")
+        return True
+
+    if stage == "waiting_new_item":
+        update_draft_items(user_id, items + new_result["items"])
+    else:
+        state.set_state(user_id, result=new_result)
+
+    show_draft(message.chat.id, user_id, editing=True)
+    return True
+
+
+def start_new_food(message, user_id, text):
+    """Новое описание еды: спрашиваем, как считать порцию."""
+    # Прошлый незаконченный черновик больше не актуален — убираем его кнопки
+    remove_keyboard(message.chat.id, state.get_state(user_id).get("draft_message_id"))
+    state.clear_state(user_id)
+
+    day_offset = db.detect_day_offset(text)
+    question = "Как считаем порцию?"
+    if day_offset:
+        question += f"\n📅 Запишу на {formatting.format_day_offset(day_offset)}"
+
+    sent = bot.reply_to(
+        message, question, reply_markup=keyboards.portion_choice_keyboard()
+    )
+
+    state.set_state(
+        user_id,
+        stage="waiting_portion_choice",
+        food_text=text,
+        explicit_meal_type=db.detect_explicit_meal_type(text),
+        day_offset=day_offset,
+        draft_message_id=sent.message_id,
+    )
 
 
 # =========================
-# ИСТОРИЯ (список)
+# ИСТОРИЯ И ПОВТОР
 # =========================
 
 
@@ -202,9 +423,84 @@ def show_history_list(chat_id, user_id, message_id=None):
         keyboard = keyboards.history_list_keyboard(meals)
 
     if message_id:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard)
+        edit(chat_id, message_id, text, keyboard)
     else:
         bot.send_message(chat_id, text, reply_markup=keyboard)
+
+
+def show_meal_detail(call, user_id, meal_id, header=""):
+    """Карточка записи из истории. Если запись уже удалена — возвращаемся к списку."""
+    meal = db.get_meal_by_id(meal_id, user_id)
+
+    if meal is None:
+        answer(call, "Запись не найдена (возможно, уже удалена)")
+        show_history_list(call.message.chat.id, user_id, call.message.message_id)
+        return
+
+    items = db.get_meal_items(meal_id, user_id)
+
+    edit(
+        call.message.chat.id,
+        call.message.message_id,
+        header + formatting.format_meal_detail(meal, items),
+        keyboards.history_item_keyboard(meal_id, has_items=bool(items)),
+    )
+
+
+def start_history_edit(call, user_id, meal_id):
+    """«Изменить состав» у записи из истории — открываем тот же редактор."""
+    items = db.get_meal_items(meal_id, user_id)
+
+    if not items:
+        answer(call, "У этой записи нет состава (старая или ручная запись)")
+        return
+
+    remove_keyboard(call.message.chat.id, state.get_state(user_id).get("draft_message_id"))
+    state.clear_state(user_id)
+    state.set_state(
+        user_id,
+        result=nutrition.make_result(items),
+        editing_meal_id=meal_id,
+        draft_message_id=call.message.message_id,
+    )
+    show_draft(
+        call.message.chat.id,
+        user_id,
+        editing=True,
+        message_id=call.message.message_id,
+    )
+
+
+def show_repeat_list(chat_id, user_id):
+    meals = db.get_frequent_meals(user_id)
+
+    if not meals:
+        bot.send_message(chat_id, "Пока нечего повторять — сначала запиши что-нибудь 🙂")
+        return
+
+    bot.send_message(
+        chat_id,
+        "🔁 Что записать ещё раз? (частые приёмы пищи)",
+        reply_markup=keyboards.repeat_list_keyboard(meals),
+    )
+
+
+def repeat_meal(call, user_id, meal_id):
+    new_id = db.copy_meal_to_today(meal_id, user_id)
+
+    if new_id is None:
+        answer(call, "Запись не найдена (возможно, уже удалена)")
+        return
+
+    _, _, _, description, calories, meal_type = db.get_meal_by_id(new_id, user_id)
+
+    edit(
+        call.message.chat.id,
+        call.message.message_id,
+        f"🔁 Записал ещё раз ({meal_type}):\n{description} — {calories} ккал\n\n"
+        f"{today_short_summary(user_id)}",
+        keyboards.undo_keyboard(new_id),
+    )
 
 
 # =========================
@@ -212,10 +508,46 @@ def show_history_list(chat_id, user_id, message_id=None):
 # =========================
 
 
+def weight_trend_text(user_id):
+    """'За неделю: −0.4 кг · за месяц: −1.8 кг' или пустая строка."""
+    last = db.get_last_weight(user_id)
+
+    if last is None:
+        return ""
+
+    parts = []
+    for days, label in ((7, "за неделю"), (30, "за месяц")):
+        date = (clock.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        past = db.get_last_weight(user_id, on_or_before=date)
+
+        if past is not None and past[0] < last[0]:
+            parts.append(f"{label}: {formatting.format_weight_change(last[1] - past[1])}")
+
+    return " · ".join(parts).capitalize()
+
+
 def ask_weight(chat_id, user_id):
     state.clear_state(user_id)
     state.set_state(user_id, stage="waiting_weight")
-    bot.send_message(chat_id, "Напиши свой текущий вес числом, например: 78.4")
+
+    last = db.get_last_weight(user_id)
+
+    if last is None:
+        bot.send_message(chat_id, "Напиши свой текущий вес числом, например: 78.4")
+        return
+
+    lines = [
+        f"⚖️ Последний вес: {last[1]:g} кг "
+        f"({formatting.format_date_ddmmyyyy(last[0])})"
+    ]
+
+    trend = weight_trend_text(user_id)
+    if trend:
+        lines.append(trend)
+
+    lines.append("\nНапиши текущий вес числом, например: 78.4")
+
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboards.weight_keyboard())
 
 
 def ask_report_period(chat_id, user_id):
@@ -233,7 +565,7 @@ def show_settings_menu(chat_id, user_id):
 
 
 # =========================
-# /start
+# КОМАНДЫ
 # =========================
 
 
@@ -243,17 +575,14 @@ def start(message):
     bot.reply_to(
         message,
         "Привет 👋\n\n"
-        "Напиши мне число калорий (например: 450) или опиши, что ты съел, обычными словами.\n"
-        "Можно сразу указать приём пищи: «на завтрак съел 3 яйца» — если не указать, "
-        "определю сам по времени сообщения.\n\n"
-        "Кнопки внизу помогут посмотреть историю, отчёты, записать вес и настроить бота под себя.",
+        "Опиши, что ты съел, обычными словами — или пришли фото тарелки 📷. "
+        "Я разложу еду на продукты и посчитаю калории и БЖУ.\n\n"
+        "• Можно указать приём пищи: «на завтрак 3 яйца»\n"
+        "• Можно записать задним числом: «вчера на ужин пицца»\n"
+        "• Можно просто число калорий: 450\n\n"
+        "Кнопки внизу — итог дня, история, повтор частых блюд, вес, отчёты и настройки.",
         reply_markup=keyboards.main_menu_keyboard(),
     )
-
-
-# =========================
-# /today
-# =========================
 
 
 @bot.message_handler(commands=["today"])
@@ -261,23 +590,27 @@ def today(message):
     ensure_registered(message.from_user.id, message.chat.id)
     user_id = message.from_user.id
 
-    meals = db.get_today_meals(user_id)
-    total = db.get_today_calories(user_id)
-    daily_goal = db.get_daily_goal(user_id)
-    remaining = daily_goal - total
-
-    bot.reply_to(message, format_today_text(meals, total, remaining, daily_goal))
-
-
-# =========================
-# /history, /weight, /report, /settings
-# =========================
+    bot.reply_to(
+        message,
+        formatting.format_today_text(
+            db.get_today_meals(user_id),
+            db.get_today_totals(user_id),
+            db.get_daily_goal(user_id),
+            db.get_protein_goal(user_id),
+        ),
+    )
 
 
 @bot.message_handler(commands=["history"])
 def history_command(message):
     ensure_registered(message.from_user.id, message.chat.id)
     show_history_list(message.chat.id, message.from_user.id)
+
+
+@bot.message_handler(commands=["repeat"])
+def repeat_command(message):
+    ensure_registered(message.from_user.id, message.chat.id)
+    show_repeat_list(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(commands=["weight"])
@@ -296,6 +629,55 @@ def report_command(message):
 def settings_command(message):
     ensure_registered(message.from_user.id, message.chat.id)
     show_settings_menu(message.chat.id, message.from_user.id)
+
+
+# =========================
+# ФОТО ЕДЫ
+# =========================
+
+
+@bot.message_handler(content_types=["photo"])
+def photo_message(message):
+    user_id = message.from_user.id
+    ensure_registered(user_id, message.chat.id)
+    caption = (message.caption or "").strip()
+
+    progress = bot.reply_to(message, "📷 Смотрю на фото...")
+
+    # Telegram хранит несколько размеров фото, последний — самый большой
+    try:
+        file_info = bot.get_file(message.photo[-1].file_id)
+        image_bytes = bot.download_file(file_info.file_path)
+    except Exception:  # ошибка Telegram или сети
+        logger.exception("Не удалось скачать фото")
+        edit(message.chat.id, progress.message_id, "Не получилось загрузить фото 😔")
+        return
+
+    try:
+        result = claude_client.analyze_food(caption, image_bytes=image_bytes)
+    except claude_client.LLMUnavailableError:
+        edit(message.chat.id, progress.message_id, LLM_UNAVAILABLE_TEXT)
+        return
+
+    if result is None:
+        edit(
+            message.chat.id,
+            progress.message_id,
+            "Не вижу на фото еды 🤔 Попробуй другой ракурс или опиши словами.",
+        )
+        return
+
+    remove_keyboard(message.chat.id, state.get_state(user_id).get("draft_message_id"))
+    state.clear_state(user_id)
+    state.set_state(
+        user_id,
+        result=result,
+        source="photo",
+        explicit_meal_type=db.detect_explicit_meal_type(caption),
+        day_offset=db.detect_day_offset(caption),
+        draft_message_id=progress.message_id,
+    )
+    show_draft(message.chat.id, user_id, editing=False, message_id=progress.message_id)
 
 
 # =========================
@@ -320,6 +702,10 @@ def text_message(message):
         show_history_list(message.chat.id, user_id)
         return
 
+    if text == "🔁 Повторить":
+        show_repeat_list(message.chat.id, user_id)
+        return
+
     if text == "⚖️ Вес":
         ask_weight(message.chat.id, user_id)
         return
@@ -335,35 +721,31 @@ def text_message(message):
     current_state = state.get_state(user_id)
     stage = current_state.get("stage")
 
+    # --- Редактор черновика: вес продукта, новый продукт, исправление словами ---
+    if handle_editor_text(message, user_id, current_state, stage, text):
+        return
+
     # --- Прислал граммы после "Я укажу граммы" ---
     if stage == "waiting_grams":
         bot.send_chat_action(message.chat.id, "typing")
 
-        food_text = current_state.get("food_text")
-        explicit_meal_type = current_state.get("explicit_meal_type")
-
         try:
-            data = claude_client.analyze_food(food_text, grams_text=text)
+            result = claude_client.analyze_food(
+                current_state.get("food_text"), grams_text=text
+            )
         except claude_client.LLMUnavailableError:
             # состояние не сбрасываем — можно просто прислать граммы ещё раз
             bot.reply_to(message, LLM_UNAVAILABLE_TEXT)
             return
 
-        if data is None:
+        if result is None:
             bot.reply_to(
                 message, "Не получилось посчитать 🤔 Попробуй написать граммы ещё раз."
             )
             return
 
-        state.set_state(user_id, stage="waiting_confirmation", result=data)
-
-        label = explicit_meal_type.capitalize() if explicit_meal_type else None
-
-        bot.reply_to(
-            message,
-            format_food_result(data, estimated=False, meal_type_label=label),
-            reply_markup=keyboards.confirm_keyboard(),
-        )
+        state.set_state(user_id, result=result, source="grams")
+        show_draft(message.chat.id, user_id, editing=False)
         return
 
     # --- Ввод веса ---
@@ -376,10 +758,16 @@ def text_message(message):
             )
             return
 
+        previous = db.get_last_weight(user_id)
         db.add_weight(user_id, weight)
         state.clear_state(user_id)
 
-        bot.reply_to(message, f"⚖️ Записал вес: {weight} кг")
+        reply = f"⚖️ Записал: {weight:g} кг"
+        if previous is not None and previous[0] != clock.today_str():
+            change = formatting.format_weight_change(weight - previous[1])
+            reply += f" ({change} с прошлого раза)"
+
+        bot.reply_to(message, reply)
         return
 
     # --- Ввод своего периода для отчёта ---
@@ -454,6 +842,24 @@ def text_message(message):
         bot.reply_to(message, f"🎯 Готово! Дневная цель: {goal} ккал.")
         return
 
+    # --- Цель по белку ---
+    if stage == "waiting_protein_goal":
+        protein_goal = parse_number(text, 0, 400)
+
+        if protein_goal is None:
+            bot.reply_to(message, "Напиши число граммов, например: 120 (или 0)")
+            return
+
+        protein_goal = round(protein_goal) or None  # 0 — убрать цель
+        db.set_protein_goal(user_id, protein_goal)
+        state.clear_state(user_id)
+
+        if protein_goal:
+            bot.reply_to(message, f"🥩 Готово! Цель по белку: {protein_goal} г в день.")
+        else:
+            bot.reply_to(message, "🥩 Цель по белку убрана.")
+        return
+
     # --- Форма расчёта цели: вес ---
     if stage == "waiting_goal_weight":
         weight = parse_number(text, 20, 400)
@@ -504,38 +910,16 @@ def text_message(message):
             )
             return
 
-        db.add_meal(user_id, "Ручная запись", calories)
-
-        total = db.get_today_calories(user_id)
-        daily_goal = db.get_daily_goal(user_id)
-        remaining = daily_goal - total
-
+        db.add_meal(user_id, db.MANUAL_DESCRIPTION, calories)
         state.clear_state(user_id)
 
         bot.reply_to(
-            message,
-            f"✅ Записал {calories} ккал\n\n"
-            f"Сегодня: {total} / {daily_goal} ккал\n"
-            f"Осталось: {remaining} ккал",
+            message, f"✅ Записал {calories} ккал\n\n{today_short_summary(user_id)}"
         )
         return
 
     # --- Новое описание еды ---
-    explicit_meal_type = db.detect_explicit_meal_type(text)
-
-    state.clear_state(user_id)
-    state.set_state(
-        user_id,
-        stage="waiting_portion_choice",
-        food_text=text,
-        explicit_meal_type=explicit_meal_type,
-    )
-
-    bot.reply_to(
-        message,
-        "Как считаем порцию?",
-        reply_markup=keyboards.portion_choice_keyboard(),
-    )
+    start_new_food(message, user_id, text)
 
 
 # =========================
@@ -543,167 +927,44 @@ def text_message(message):
 # =========================
 
 
-def show_meal_detail(call, user_id, meal_id, header=""):
-    """Карточка записи из истории. Если запись уже удалена — возвращаемся к списку."""
-    meal = db.get_meal_by_id(meal_id, user_id)
-
-    if meal is None:
-        bot.answer_callback_query(call.id, "Запись не найдена (возможно, уже удалена)")
-        show_history_list(call.message.chat.id, user_id, call.message.message_id)
-        return
-
-    bot.answer_callback_query(call.id)
-    bot.edit_message_text(
-        header + format_meal_detail(meal),
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=keyboards.history_item_keyboard(meal_id),
-    )
-
-
-def estimate_portion(call, user_id, current_state):
-    """Кнопка «Оцени сам»: просим LLM оценить порции и показываем результат."""
-    chat_id = call.message.chat.id
-    message_id = call.message.message_id
-
-    bot.edit_message_text("🤖 Считаю...", chat_id, message_id)
-
-    try:
-        result = claude_client.analyze_food(current_state.get("food_text"))
-    except claude_client.LLMUnavailableError:
-        # Возвращаем кнопки, чтобы можно было нажать ещё раз
-        bot.edit_message_text(
-            LLM_UNAVAILABLE_TEXT,
-            chat_id,
-            message_id,
-            reply_markup=keyboards.portion_choice_keyboard(),
-        )
-        return
-
-    if result is None:
-        state.clear_state(user_id)
-        bot.edit_message_text(
-            "Не получилось разобрать это как еду 🤔 Попробуй переформулировать.",
-            chat_id,
-            message_id,
-        )
-        return
-
-    state.set_state(user_id, stage="waiting_confirmation", result=result)
-
-    explicit_meal_type = current_state.get("explicit_meal_type")
-    label = explicit_meal_type.capitalize() if explicit_meal_type else None
-
-    bot.edit_message_text(
-        format_food_result(result, estimated=True, meal_type_label=label),
-        chat_id,
-        message_id,
-        reply_markup=keyboards.confirm_keyboard(),
-    )
-
-
-
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     user_id = call.from_user.id
-    ensure_registered(user_id, call.message.chat.id)
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    ensure_registered(user_id, chat_id)
     current_state = state.get_state(user_id)
     data = call.data
 
-    if data in ("portion_grams", "portion_estimate") and not current_state.get(
-        "food_text"
-    ):
-        # Кнопка от старого сообщения, а состояние уже потеряно
-        state.clear_state(user_id)
-        bot.edit_message_text(
-            STATE_LOST_TEXT, call.message.chat.id, call.message.message_id
-        )
-
-    elif data == "portion_grams":
-        state.set_state(user_id, stage="waiting_grams")
-        bot.edit_message_text(
-            "Напиши вес каждого продукта в граммах, например:\n"
-            "рис 180 г, курица 200 г, овощи 100 г",
-            call.message.chat.id,
-            call.message.message_id,
-        )
-
-    elif data == "portion_estimate":
-        estimate_portion(call, user_id, current_state)
-
-    elif data == "confirm_save":
-        result = current_state.get("result")
-        explicit_meal_type = current_state.get("explicit_meal_type")
-
-        if result is None:
-            # Состояние потерялось (перезапуск) или кнопку нажали второй раз
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(
-                STATE_LOST_TEXT, call.message.chat.id, call.message.message_id
-            )
+    # --- Черновик приёма пищи ---
+    if data.startswith(DRAFT_CALLBACK_PREFIXES):
+        if message_id != current_state.get("draft_message_id"):
+            # Кнопка от старого черновика: есть более новый или этот уже записан
+            answer(call, "Этот черновик устарел — напиши еду заново")
+            remove_keyboard(chat_id, message_id)
             return
 
-        description = build_description(result)
-
-        db.add_meal(
-            user_id,
-            description,
-            result["total_kcal"],
-            protein=result["total_protein"],
-            fat=result["total_fat"],
-            carbs=result["total_carbs"],
-            meal_type=explicit_meal_type,
-        )
-
-        state.clear_state(user_id)
-
-        total = db.get_today_calories(user_id)
-        daily_goal = db.get_daily_goal(user_id)
-        remaining = daily_goal - total
-
-        bot.edit_message_text(
-            f"✅ Записано!\n\nСегодня: {total} / {daily_goal} ккал\nОсталось: {remaining} ккал",
-            call.message.chat.id,
-            call.message.message_id,
-        )
-
-    elif data == "confirm_edit":
-        state.clear_state(user_id)
-        bot.edit_message_text(
-            "Хорошо, напиши заново, что ты съел.",
-            call.message.chat.id,
-            call.message.message_id,
-        )
-
-    elif data == "confirm_cancel":
-        state.clear_state(user_id)
-        bot.edit_message_text(
-            "❌ Отменено", call.message.chat.id, call.message.message_id
-        )
+        handle_draft_callback(call, user_id, current_state, data)
 
     # --- История ---
 
     elif data == "histlist":
-        show_history_list(call.message.chat.id, user_id, call.message.message_id)
+        show_history_list(chat_id, user_id, message_id)
 
-    elif data.startswith("histopen_"):
-        meal_id = int(data.split("_")[1])
-        show_meal_detail(call, user_id, meal_id)
-        return
+    elif data.startswith(("histopen_", "histback_")):
+        show_meal_detail(call, user_id, int(data.split("_")[1]))
+
+    elif data.startswith("histedit_"):
+        start_history_edit(call, user_id, int(data.split("_")[1]))
 
     elif data.startswith("histtype_"):
         meal_id = int(data.split("_")[1])
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             "Выбери правильный приём пищи:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.meal_type_choice_keyboard(meal_id),
+            keyboards.meal_type_choice_keyboard(meal_id),
         )
-
-    elif data.startswith("histback_"):
-        meal_id = int(data.split("_")[1])
-        show_meal_detail(call, user_id, meal_id)
-        return
 
     elif data.startswith("settype_"):
         _, meal_id_str, code = data.split("_")
@@ -714,68 +975,85 @@ def handle_callback(call):
             db.update_meal_type(meal_id, user_id, new_type)
 
         show_meal_detail(call, user_id, meal_id, header="✅ Обновлено!\n\n")
-        return
 
     elif data.startswith("histdel_"):
         meal_id = int(data.split("_")[1])
-        db.delete_meal(meal_id, user_id)
+        meal = db.get_meal_by_id(meal_id, user_id)
 
-        bot.answer_callback_query(call.id, "Удалено")
-        show_history_list(call.message.chat.id, user_id, call.message.message_id)
-        return
+        if meal is None:
+            answer(call, "Запись не найдена (возможно, уже удалена)")
+            show_history_list(chat_id, user_id, message_id)
+            return
+
+        edit(
+            chat_id,
+            message_id,
+            "Удалить эту запись?\n\n" + formatting.format_meal_detail(meal),
+            keyboards.delete_confirm_keyboard(meal_id),
+        )
+
+    elif data.startswith("histdelok_"):
+        db.delete_meal(int(data.split("_")[1]), user_id)
+        answer(call, "Удалено")
+        show_history_list(chat_id, user_id, message_id)
+
+    # --- Повтор ---
+
+    elif data.startswith("repeat_"):
+        repeat_meal(call, user_id, int(data.split("_")[1]))
+
+    elif data.startswith("undo_"):
+        db.delete_meal(int(data.split("_")[1]), user_id)
+        edit(
+            chat_id,
+            message_id,
+            f"↩️ Отменил повтор.\n\n{today_short_summary(user_id)}",
+        )
+
+    # --- Вес ---
+
+    elif data == "weight_chart":
+        image = reports.build_weight_image(user_id)
+
+        if image is None:
+            answer(call, "Для графика нужно хотя бы 2 записи веса")
+            return
+
+        bot.send_photo(chat_id, image)
 
     # --- Отчёты ---
 
-    elif data == "reportperiod_week":
-        state.clear_state(user_id)
+    elif data in ("reportperiod_week", "reportperiod_month"):
+        days = 6 if data == "reportperiod_week" else 29
         today_date = clock.now().date()
-        start = today_date - timedelta(days=6)
-        state.set_state(
-            user_id,
-            stage="waiting_report_format",
-            report_start=start.isoformat(),
-            report_end=today_date.isoformat(),
-        )
-        bot.edit_message_text(
-            "Какой формат отчёта?",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.report_format_keyboard(),
-        )
+        start = today_date - timedelta(days=days)
 
-    elif data == "reportperiod_month":
         state.clear_state(user_id)
-        today_date = clock.now().date()
-        start = today_date - timedelta(days=29)
         state.set_state(
             user_id,
             stage="waiting_report_format",
             report_start=start.isoformat(),
             report_end=today_date.isoformat(),
         )
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             "Какой формат отчёта?",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.report_format_keyboard(),
+            keyboards.report_format_keyboard(),
         )
 
     elif data == "reportperiod_custom":
         state.clear_state(user_id)
         state.set_state(user_id, stage="waiting_custom_period")
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             "Напиши период в формате ДД.ММ.ГГГГ-ДД.ММ.ГГГГ\nНапример: 01.09.2026-14.09.2026",
-            call.message.chat.id,
-            call.message.message_id,
         )
 
     elif data.startswith("reportformat_") and not current_state.get("report_start"):
-        # Период потерялся (например, бот перезапускался)
-        bot.edit_message_text(
-            "Я забыл выбранный период 🤷 Открой 📈 Отчёт ещё раз.",
-            call.message.chat.id,
-            call.message.message_id,
-        )
+        # Период потерялся (например, отчёт уже построен по этой кнопке)
+        edit(chat_id, message_id, "Я забыл выбранный период 🤷 Открой 📈 Отчёт ещё раз.")
 
     elif data == "reportformat_text":
         start = current_state.get("report_start")
@@ -784,28 +1062,24 @@ def handle_callback(call):
         report_text = reports.build_text_report(user_id, start, end)
         state.clear_state(user_id)
 
-        bot.edit_message_text(
-            report_text, call.message.chat.id, call.message.message_id
-        )
+        edit(chat_id, message_id, report_text)
 
     elif data == "reportformat_image":
         start = current_state.get("report_start")
         end = current_state.get("report_end")
 
-        bot.edit_message_text(
-            "📈 Строю график...", call.message.chat.id, call.message.message_id
-        )
+        edit(chat_id, message_id, "📈 Строю график...")
 
         image = reports.build_image_report(user_id, start, end)
         state.clear_state(user_id)
 
         if image is None:
             bot.send_message(
-                call.message.chat.id,
+                chat_id,
                 "За этот период записей нет — картинку строить не из чего.",
             )
         else:
-            bot.send_photo(call.message.chat.id, image)
+            bot.send_photo(chat_id, image)
 
     # --- Настройки ---
 
@@ -814,68 +1088,78 @@ def handle_callback(call):
         state.set_state(user_id, stage="waiting_reminder_time")
 
         current_hour, current_minute = db.get_reminder_time(user_id)
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             f"Сейчас напоминание приходит в {current_hour:02d}:{current_minute:02d}.\n"
             "Напиши новое время в формате ЧЧ:ММ, например 21:00",
-            call.message.chat.id,
-            call.message.message_id,
         )
 
     elif data == "settings_goal":
         current_goal = db.get_daily_goal(user_id)
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             f"Сейчас дневная цель: {current_goal} ккал.\nКак хочешь её задать?",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.goal_mode_keyboard(),
+            keyboards.goal_mode_keyboard(),
+        )
+
+    elif data == "settings_protein":
+        state.clear_state(user_id)
+        state.set_state(user_id, stage="waiting_protein_goal")
+
+        protein_goal = db.get_protein_goal(user_id)
+        current = f"{protein_goal} г" if protein_goal else "не задана"
+        edit(
+            chat_id,
+            message_id,
+            f"Сейчас цель по белку: {current}.\n"
+            "Напиши, сколько граммов белка в день хочешь есть (например, 120), "
+            "или 0 — чтобы убрать цель.\n\n"
+            "Подсказка: обычно это 1.4–1.8 г на кг веса.",
         )
 
     elif data == "settings_back":
-        bot.edit_message_text(
-            "⚙️ Настройки:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.settings_menu_keyboard(),
-        )
+        edit(chat_id, message_id, "⚙️ Настройки:", keyboards.settings_menu_keyboard())
 
     elif data == "goalmode_manual":
         state.clear_state(user_id)
         state.set_state(user_id, stage="waiting_manual_goal")
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             "Напиши свою дневную цель числом (в ккал), например: 2200",
-            call.message.chat.id,
-            call.message.message_id,
         )
 
     elif data == "goalmode_calc":
         state.clear_state(user_id)
         state.set_state(user_id, stage="waiting_goal_weight")
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             "Небольшая форма, чтобы рассчитать цель под тебя.\n\nКакой у тебя вес в кг?",
-            call.message.chat.id,
-            call.message.message_id,
         )
 
     elif data.startswith("gender_"):
         gender = data.split("_")[1]  # male / female
         state.set_state(user_id, goal_gender=gender)
 
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             "Какой у тебя уровень активности?",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.activity_keyboard(),
+            keyboards.activity_keyboard(),
         )
 
     elif data.startswith("activity_"):
         activity = data[len("activity_") :]  # low / medium / high / very_high
         state.set_state(user_id, goal_activity=activity)
 
-        bot.edit_message_text(
+        edit(
+            chat_id,
+            message_id,
             "И последнее — какая у тебя цель?",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.goal_type_keyboard(),
+            keyboards.goal_type_keyboard(),
         )
 
     elif data.startswith("goaltype_"):
@@ -888,27 +1172,28 @@ def handle_callback(call):
         activity = current_state.get("goal_activity")
 
         if None in (weight, height, age, gender, activity):
-            bot.answer_callback_query(
-                call.id, "Что-то потерялось, начни заново через Настройки"
-            )
+            answer(call, "Что-то потерялось, начни заново через Настройки")
             state.clear_state(user_id)
             return
 
         goal = calc.calculate_daily_goal(
             weight, height, age, gender, activity, goal_type
         )
+        protein_goal = calc.calculate_protein_goal(weight, goal_type)
 
         db.set_daily_goal(user_id, goal)
+        db.set_protein_goal(user_id, protein_goal)
         state.clear_state(user_id)
 
-        bot.edit_message_text(
-            f"🎯 Готово! Рассчитанная дневная цель: {goal} ккал.\n\n"
+        edit(
+            chat_id,
+            message_id,
+            f"🎯 Готово! Рассчитанная дневная цель: {goal} ккал.\n"
+            f"🥩 Цель по белку: {protein_goal} г.\n\n"
             "Если захочешь поменять — снова зайди в ⚙️ Настройки.",
-            call.message.chat.id,
-            call.message.message_id,
         )
 
-    bot.answer_callback_query(call.id)
+    answer(call)
 
 
 # =========================
@@ -920,6 +1205,7 @@ bot.set_my_commands(
         telebot.types.BotCommand("start", "Начать"),
         telebot.types.BotCommand("today", "Сегодня"),
         telebot.types.BotCommand("history", "История записей"),
+        telebot.types.BotCommand("repeat", "Повторить приём пищи"),
         telebot.types.BotCommand("weight", "Записать вес"),
         telebot.types.BotCommand("report", "Отчёт за период"),
         telebot.types.BotCommand("settings", "Настройки"),

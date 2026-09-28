@@ -1,15 +1,16 @@
-user_states = {}
+"""Состояние диалога: на каком шаге пользователь и что он уже ввёл.
+Хранится в базе (таблица user_states), поэтому переживает перезапуск бота."""
+
+import db
 
 
 def get_state(user_id):
-    return user_states.get(user_id, {})
+    return db.load_state(user_id)
 
 
 def set_state(user_id, **kwargs):
-    if user_id not in user_states:
-        user_states[user_id] = {}
-    user_states[user_id].update(kwargs)
+    db.update_state(user_id, kwargs)
 
 
 def clear_state(user_id):
-    user_states.pop(user_id, None)
+    db.delete_state(user_id)

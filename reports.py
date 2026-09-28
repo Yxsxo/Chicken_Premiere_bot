@@ -1,10 +1,19 @@
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from matplotlib.dates import DateFormatter
 from matplotlib.figure import Figure
 
+import clock
 import db
 import formatting
+
+
+def _figure_to_png(figure):
+    image = io.BytesIO()
+    figure.savefig(image, format="png")
+    image.seek(0)
+    return image
 
 
 def build_text_report(user_id, start_date, end_date):
@@ -61,8 +70,28 @@ def build_image_report(user_id, start_date, end_date):
     axes.tick_params(axis="x", rotation=45)
     figure.tight_layout()
 
-    image = io.BytesIO()
-    figure.savefig(image, format="png")
-    image.seek(0)
+    return _figure_to_png(figure)
 
-    return image
+
+def build_weight_image(user_id, days=90):
+    """Линия веса за последние days дней. None — если записей меньше двух."""
+    start_date = (clock.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    data = db.get_weights(user_id, start_date)
+
+    if len(data) < 2:
+        return None
+
+    dates = [datetime.strptime(row[0], "%Y-%m-%d") for row in data]
+    weights = [row[1] for row in data]
+
+    figure = Figure(figsize=(8, 4))
+    axes = figure.subplots()
+    axes.plot(dates, weights, marker="o", color="#2196F3")
+    axes.set_title(f"Вес за {days} дней")
+    axes.set_ylabel("Кг")
+    axes.grid(alpha=0.3)
+    axes.xaxis.set_major_formatter(DateFormatter("%d.%m"))
+    figure.autofmt_xdate()
+    figure.tight_layout()
+
+    return _figure_to_png(figure)
