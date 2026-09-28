@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -21,7 +22,10 @@ MANUAL_DESCRIPTION = "Ручная запись"
 # ПОДКЛЮЧЕНИЕ К БАЗЕ
 # =========================
 
-connection = sqlite3.connect("calories.db", check_same_thread=False)
+# Путь к файлу базы: на хостинге — постоянный диск, в тестах — временная папка
+DB_PATH = os.getenv("DB_PATH", "calories.db")
+
+connection = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = connection.cursor()
 
 # Бот обрабатывает сообщения в нескольких потоках, плюс поток напоминаний.

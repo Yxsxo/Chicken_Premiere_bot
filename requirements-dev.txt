@@ -1,0 +1,3 @@
+# Для разработки: всё из requirements.txt + инструменты тестов
+-r requirements.txt
+pytest==9.1.1

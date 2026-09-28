@@ -1,0 +1,27 @@
+# GitHub сам запускает этот сценарий при каждом push и pull request.
+# Результат виден во вкладке Actions и значком в README.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Скачать код
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установить зависимости
+        run: pip install -r requirements-dev.txt
+
+      - name: Запустить тесты
+        run: pytest -v

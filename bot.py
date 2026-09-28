@@ -22,22 +22,24 @@ import clock
 # ЛОГИ
 # =========================
 
-# Пишем и в консоль, и в bot.log. Когда файл дорастёт до 1 МБ, он станет
-# bot.log.1, а старые копии дальше bot.log.3 удаляются — диск не забьётся.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        RotatingFileHandler(
-            "bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
-        ),
-    ],
-)
-# httpx пишет в INFO каждый запрос к API — это шум, оставляем только проблемы
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
 logger = logging.getLogger("bot")
+
+
+def setup_logging():
+    """Пишем и в консоль, и в bot.log. Когда файл дорастёт до 1 МБ, он станет
+    bot.log.1, а старые копии дальше bot.log.3 удаляются — диск не забьётся."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            RotatingFileHandler(
+                "bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            ),
+        ],
+    )
+    # httpx пишет в INFO каждый запрос к API — это шум, оставляем только проблемы
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class LogExceptionHandler(telebot.ExceptionHandler):
@@ -1200,20 +1202,29 @@ def handle_callback(call):
 # ЗАПУСК
 # =========================
 
-bot.set_my_commands(
-    [
-        telebot.types.BotCommand("start", "Начать"),
-        telebot.types.BotCommand("today", "Сегодня"),
-        telebot.types.BotCommand("history", "История записей"),
-        telebot.types.BotCommand("repeat", "Повторить приём пищи"),
-        telebot.types.BotCommand("weight", "Записать вес"),
-        telebot.types.BotCommand("report", "Отчёт за период"),
-        telebot.types.BotCommand("settings", "Настройки"),
-    ]
-)
 
-reminders.start_reminders(bot)
+def main():
+    setup_logging()
 
-logger.info("Бот запущен! Часовой пояс: %s", clock.TIMEZONE)
+    bot.set_my_commands(
+        [
+            telebot.types.BotCommand("start", "Начать"),
+            telebot.types.BotCommand("today", "Сегодня"),
+            telebot.types.BotCommand("history", "История записей"),
+            telebot.types.BotCommand("repeat", "Повторить приём пищи"),
+            telebot.types.BotCommand("weight", "Записать вес"),
+            telebot.types.BotCommand("report", "Отчёт за период"),
+            telebot.types.BotCommand("settings", "Настройки"),
+        ]
+    )
 
-bot.infinity_polling(skip_pending=True)
+    reminders.start_reminders(bot)
+
+    logger.info("Бот запущен! Часовой пояс: %s", clock.TIMEZONE)
+
+    bot.infinity_polling(skip_pending=True)
+
+
+# Запуск только при `python bot.py`; при импорте (например, из тестов) бот не стартует
+if __name__ == "__main__":
+    main()
