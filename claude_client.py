@@ -1,12 +1,16 @@
 import os
 import json
 
+import anthropic
 from dotenv import load_dotenv
-from anthropic import Anthropic
 
 load_dotenv()
 
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = anthropic.Anthropic(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    timeout=30,  # сколько секунд ждать ответа, дальше — ошибка
+    max_retries=2,  # при сбое сети или перегрузке SDK сам повторит запрос
+)
 
 MODEL = "claude-haiku-4-5-20251001"
 
@@ -16,35 +20,84 @@ SYSTEM_PROMPT = """Ты — помощник по подсчёту калори�
 1. Разбить сообщение на отдельные продукты/блюда.
 2. Определить вес порции каждого продукта в граммах.
 3. Для каждого продукта также указать "quantity" — количество так, как человек написал бы его естественно: для штучных продуктов (яйца, бутерброды, бананы, котлеты и т.п.) — в штуках, например "4 шт"; для остального (рис, мясо порцией, салат и т.п.) — в граммах, например "180 г".
-4. Посчитать калории и БЖУ (белки, жиры, углеводы) для каждого продукта и суммарно.
+4. Посчитать калории и БЖУ (белки, жиры, углеводы) для каждого продукта.
 
 Отвечай СТРОГО в формате JSON, без пояснений вокруг, без markdown-разметки (без ```), только сам JSON, в такой структуре:
 
 {
   "items": [
     {"name": "название продукта в единственном числе", "quantity": "количество текстом, например 4 шт или 180 г", "grams": число, "kcal": число, "protein": число, "fat": число, "carbs": число}
-  ],
-  "total_kcal": число,
-  "total_protein": число,
-  "total_fat": число,
-  "total_carbs": число
+  ]
 }
 
-"grams" — это всегда вес в граммах числом (используется для расчётов), а "quantity" — то же самое количество, но по-человечески (штуки или граммы текстом). Все числа — целые или с одним знаком после запятой. Никакого текста, кроме этого JSON, в ответе быть не должно."""
+"grams" — это всегда вес в граммах числом (используется для расчётов), а "quantity" — то же самое количество, но по-человечески (штуки или граммы текстом). Все числа — целые или с одним знаком после запятой.
+Если в сообщении нет еды или напитков, верни {"items": []}.
+Никакого текста, кроме этого JSON, в ответе быть не должно."""
+
+
+class LLMUnavailableError(Exception):
+    """LLM не ответил: нет сети, таймаут, сервис перегружен, неверный ключ."""
 
 
 def _extract_json(raw_text):
-    text = raw_text.strip()
+    """Вырезает JSON из ответа, даже если модель добавила ``` или текст вокруг."""
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
 
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
+    if start == -1 or end == -1:
+        return None
 
-    return text.strip()
+    return raw_text[start : end + 1]
+
+
+def _to_number(value):
+    """Число из ответа модели: 120, 120.5 или даже строка "120,5"."""
+    return float(str(value).replace(",", "."))
+
+
+def _parse_result(raw_text):
+    """Проверяет ответ модели и приводит его к нашему формату. None — если разобрать не вышло."""
+    json_text = _extract_json(raw_text)
+
+    if json_text is None:
+        return None
+
+    try:
+        data = json.loads(json_text)
+        items = []
+
+        for item in data["items"]:
+            grams = round(_to_number(item["grams"]))
+            items.append(
+                {
+                    "name": str(item["name"]),
+                    "quantity": str(item.get("quantity") or f"{grams} г"),
+                    "grams": grams,
+                    "kcal": round(_to_number(item["kcal"])),
+                    "protein": round(_to_number(item.get("protein", 0)), 1),
+                    "fat": round(_to_number(item.get("fat", 0)), 1),
+                    "carbs": round(_to_number(item.get("carbs", 0)), 1),
+                }
+            )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+    if not items:
+        return None
+
+    # Итоги считаем сами из продуктов: модель иногда ошибается в сложении
+    return {
+        "items": items,
+        "total_kcal": sum(item["kcal"] for item in items),
+        "total_protein": round(sum(item["protein"] for item in items), 1),
+        "total_fat": round(sum(item["fat"] for item in items), 1),
+        "total_carbs": round(sum(item["carbs"] for item in items), 1),
+    }
 
 
 def analyze_food(food_text, grams_text=None):
+    """Разбирает еду. Возвращает dict или None (не похоже на еду).
+    Если LLM недоступен — бросает LLMUnavailableError."""
     if grams_text:
         user_message = (
             f"Продукты: {food_text}\n"
@@ -56,16 +109,14 @@ def analyze_food(food_text, grams_text=None):
     else:
         user_message = food_text
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
-
-    raw_text = response.content[0].text
-
     try:
-        return json.loads(_extract_json(raw_text))
-    except json.JSONDecodeError:
-        return None
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+    except anthropic.AnthropicError as error:
+        raise LLMUnavailableError(str(error)) from error
+
+    return _parse_result(response.content[0].text)

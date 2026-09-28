@@ -35,6 +35,15 @@ MEAL_TYPE_EMOJI = {
 
 MEAL_TYPE_ORDER = ["завтрак", "обед", "ужин", "перекус"]
 
+LLM_UNAVAILABLE_TEXT = (
+    "😔 Сервис подсчёта сейчас не отвечает. Попробуй ещё раз через минуту."
+)
+
+STATE_LOST_TEXT = (
+    "Я потерял твоё сообщение (возможно, бот перезапускался) 🤷\n"
+    "Напиши заново, что ты съел."
+)
+
 
 def ensure_registered(user_id, chat_id):
     db.register_user(user_id, chat_id)
@@ -285,7 +294,12 @@ def text_message(message):
         food_text = current_state.get("food_text")
         explicit_meal_type = current_state.get("explicit_meal_type")
 
-        data = claude_client.analyze_food(food_text, grams_text=text)
+        try:
+            data = claude_client.analyze_food(food_text, grams_text=text)
+        except claude_client.LLMUnavailableError:
+            # состояние не сбрасываем — можно просто прислать граммы ещё раз
+            bot.reply_to(message, LLM_UNAVAILABLE_TEXT)
+            return
 
         if data is None:
             bot.reply_to(
@@ -456,6 +470,48 @@ def text_message(message):
 # =========================
 
 
+def estimate_portion(call, user_id, current_state):
+    """Кнопка «Оцени сам»: просим LLM оценить порции и показываем результат."""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    bot.edit_message_text("🤖 Считаю...", chat_id, message_id)
+
+    try:
+        result = claude_client.analyze_food(current_state.get("food_text"))
+    except claude_client.LLMUnavailableError:
+        # Возвращаем кнопки, чтобы можно было нажать ещё раз
+        bot.edit_message_text(
+            LLM_UNAVAILABLE_TEXT,
+            chat_id,
+            message_id,
+            reply_markup=keyboards.portion_choice_keyboard(),
+        )
+        return
+
+    if result is None:
+        state.clear_state(user_id)
+        bot.edit_message_text(
+            "Не получилось разобрать это как еду 🤔 Попробуй переформулировать.",
+            chat_id,
+            message_id,
+        )
+        return
+
+    state.set_state(user_id, stage="waiting_confirmation", result=result)
+
+    explicit_meal_type = current_state.get("explicit_meal_type")
+    label = explicit_meal_type.capitalize() if explicit_meal_type else None
+
+    bot.edit_message_text(
+        format_food_result(result, estimated=True, meal_type_label=label),
+        chat_id,
+        message_id,
+        reply_markup=keyboards.confirm_keyboard(),
+    )
+
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     user_id = call.from_user.id
@@ -463,7 +519,16 @@ def handle_callback(call):
     current_state = state.get_state(user_id)
     data = call.data
 
-    if data == "portion_grams":
+    if data in ("portion_grams", "portion_estimate") and not current_state.get(
+        "food_text"
+    ):
+        # Кнопка от старого сообщения, а состояние уже потеряно
+        state.clear_state(user_id)
+        bot.edit_message_text(
+            STATE_LOST_TEXT, call.message.chat.id, call.message.message_id
+        )
+
+    elif data == "portion_grams":
         state.set_state(user_id, stage="waiting_grams")
         bot.edit_message_text(
             "Напиши вес каждого продукта в граммах, например:\n"
@@ -473,31 +538,7 @@ def handle_callback(call):
         )
 
     elif data == "portion_estimate":
-        bot.edit_message_text(
-            "🤖 Считаю...", call.message.chat.id, call.message.message_id
-        )
-
-        food_text = current_state.get("food_text")
-        explicit_meal_type = current_state.get("explicit_meal_type")
-
-        result = claude_client.analyze_food(food_text)
-
-        if result is None:
-            bot.send_message(
-                call.message.chat.id,
-                "Не получилось разобрать это как еду 🤔 Попробуй переформулировать.",
-            )
-            state.clear_state(user_id)
-        else:
-            state.set_state(user_id, stage="waiting_confirmation", result=result)
-
-            label = explicit_meal_type.capitalize() if explicit_meal_type else None
-
-            bot.send_message(
-                call.message.chat.id,
-                format_food_result(result, estimated=True, meal_type_label=label),
-                reply_markup=keyboards.confirm_keyboard(),
-            )
+        estimate_portion(call, user_id, current_state)
 
     elif data == "confirm_save":
         result = current_state.get("result")
