@@ -1,5 +1,8 @@
 import sqlite3
-from datetime import datetime
+import threading
+from functools import wraps
+
+import clock
 
 # =========================
 # НАСТРОЙКИ ПО УМОЛЧАНИЮ
@@ -15,6 +18,22 @@ DEFAULT_REMINDER_MINUTE = 0
 
 connection = sqlite3.connect("calories.db", check_same_thread=False)
 cursor = connection.cursor()
+
+# Бот обрабатывает сообщения в нескольких потоках, плюс поток напоминаний.
+# Курсор у всех общий, поэтому пускаем к базе строго по одному.
+_db_lock = threading.RLock()
+
+
+def synchronized(func):
+    """Декоратор: функция работает с базой, только взяв _db_lock."""
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with _db_lock:
+            return func(*args, **kwargs)
+
+    return wrapper
+
 
 # =========================
 # СОЗДАНИЕ ТАБЛИЦ (если их ещё нет)
@@ -132,6 +151,7 @@ def detect_explicit_meal_type(text):
 # =========================
 
 
+@synchronized
 def register_user(user_id, chat_id):
     cursor.execute(
         """
@@ -144,6 +164,7 @@ def register_user(user_id, chat_id):
     connection.commit()
 
 
+@synchronized
 def get_all_known_users():
     cursor.execute(
         "SELECT user_id, chat_id, daily_goal, reminder_hour, reminder_minute FROM known_users"
@@ -151,12 +172,14 @@ def get_all_known_users():
     return cursor.fetchall()
 
 
+@synchronized
 def get_daily_goal(user_id):
     cursor.execute("SELECT daily_goal FROM known_users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     return row[0] if row else DEFAULT_DAILY_GOAL
 
 
+@synchronized
 def set_daily_goal(user_id, goal):
     cursor.execute(
         "UPDATE known_users SET daily_goal = ? WHERE user_id = ?",
@@ -165,6 +188,7 @@ def set_daily_goal(user_id, goal):
     connection.commit()
 
 
+@synchronized
 def get_reminder_time(user_id):
     cursor.execute(
         "SELECT reminder_hour, reminder_minute FROM known_users WHERE user_id = ?",
@@ -174,6 +198,7 @@ def get_reminder_time(user_id):
     return row if row else (DEFAULT_REMINDER_HOUR, DEFAULT_REMINDER_MINUTE)
 
 
+@synchronized
 def set_reminder_time(user_id, hour, minute):
     cursor.execute(
         "UPDATE known_users SET reminder_hour = ?, reminder_minute = ? WHERE user_id = ?",
@@ -187,8 +212,9 @@ def set_reminder_time(user_id, hour, minute):
 # =========================
 
 
+@synchronized
 def get_today_calories(user_id):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = clock.today_str()
 
     cursor.execute(
         "SELECT SUM(calories) FROM meals WHERE user_id = ? AND date = ?",
@@ -199,10 +225,11 @@ def get_today_calories(user_id):
     return result if result is not None else 0
 
 
+@synchronized
 def add_meal(
     user_id, description, calories, protein=None, fat=None, carbs=None, meal_type=None
 ):
-    now = datetime.now()
+    now = clock.now()
     today = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
 
@@ -232,8 +259,9 @@ def add_meal(
     connection.commit()
 
 
+@synchronized
 def get_today_meals(user_id):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = clock.today_str()
 
     cursor.execute(
         """
@@ -247,6 +275,7 @@ def get_today_meals(user_id):
     return cursor.fetchall()
 
 
+@synchronized
 def get_last_meals(user_id, limit=15):
     cursor.execute(
         """
@@ -261,6 +290,7 @@ def get_last_meals(user_id, limit=15):
     return cursor.fetchall()
 
 
+@synchronized
 def get_meal_by_id(meal_id, user_id):
     cursor.execute(
         """
@@ -273,6 +303,7 @@ def get_meal_by_id(meal_id, user_id):
     return cursor.fetchone()
 
 
+@synchronized
 def delete_meal(meal_id, user_id):
     cursor.execute(
         "DELETE FROM meals WHERE id = ? AND user_id = ?",
@@ -281,6 +312,7 @@ def delete_meal(meal_id, user_id):
     connection.commit()
 
 
+@synchronized
 def update_meal_type(meal_id, user_id, new_type):
     cursor.execute(
         "UPDATE meals SET meal_type = ? WHERE id = ? AND user_id = ?",
@@ -294,8 +326,9 @@ def update_meal_type(meal_id, user_id, new_type):
 # =========================
 
 
+@synchronized
 def add_weight(user_id, weight):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = clock.today_str()
 
     cursor.execute(
         "INSERT INTO weights (user_id, date, weight) VALUES (?, ?, ?)",
@@ -309,6 +342,7 @@ def add_weight(user_id, weight):
 # =========================
 
 
+@synchronized
 def get_calories_by_day(user_id, start_date, end_date):
     cursor.execute(
         """

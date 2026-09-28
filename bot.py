@@ -1,5 +1,7 @@
 import os
+import logging
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 
 import telebot
 from dotenv import load_dotenv
@@ -12,6 +14,37 @@ import reports
 import reminders
 import formatting
 import calc
+import clock
+
+# =========================
+# ЛОГИ
+# =========================
+
+# Пишем и в консоль, и в bot.log. Когда файл дорастёт до 1 МБ, он станет
+# bot.log.1, а старые копии дальше bot.log.3 удаляются — диск не забьётся.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            "bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        ),
+    ],
+)
+# httpx пишет в INFO каждый запрос к API — это шум, оставляем только проблемы
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+logger = logging.getLogger("bot")
+
+
+class LogExceptionHandler(telebot.ExceptionHandler):
+    """Любая непойманная ошибка в обработчиках попадает в лог, а бот работает дальше."""
+
+    def handle(self, exception):
+        logger.error("Ошибка в обработчике", exc_info=exception)
+        return True
+
 
 # =========================
 # НАСТРОЙКИ
@@ -24,7 +57,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 if TOKEN is None:
     raise ValueError("Не найден BOT_TOKEN в файле .env")
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, exception_handler=LogExceptionHandler())
 
 MEAL_TYPE_EMOJI = {
     "завтрак": "🍳",
@@ -47,6 +80,21 @@ STATE_LOST_TEXT = (
 
 def ensure_registered(user_id, chat_id):
     db.register_user(user_id, chat_id)
+
+
+def parse_number(text, min_value, max_value):
+    """Число из текста пользователя ("78,4" тоже годится) в разумных границах.
+    Если это не число или оно вне границ — None."""
+    try:
+        value = float(text.replace(",", "."))
+    except ValueError:
+        return None
+
+    # nan и бесконечность эту проверку тоже не пройдут
+    if not (min_value <= value <= max_value):
+        return None
+
+    return value
 
 
 # =========================
@@ -96,7 +144,7 @@ def format_meal_detail(meal):
 
 
 def format_today_text(meals, total, remaining, daily_goal):
-    today_date_str = datetime.now().strftime("%Y-%m-%d")
+    today_date_str = clock.today_str()
     text = f"📊 {formatting.format_date_with_weekday(today_date_str)}:\n\n"
 
     if not meals:
@@ -320,11 +368,11 @@ def text_message(message):
 
     # --- Ввод веса ---
     if stage == "waiting_weight":
-        try:
-            weight = float(text.replace(",", "."))
-        except ValueError:
+        weight = parse_number(text, 20, 400)
+
+        if weight is None:
             bot.reply_to(
-                message, "Не получилось распознать число. Напиши вес так: 78.4"
+                message, "Не получилось распознать вес. Напиши число в кг, например: 78.4"
             )
             return
 
@@ -346,6 +394,14 @@ def text_message(message):
             )
             return
 
+        if start_date > end_date:
+            bot.reply_to(message, "Начало периода должно быть раньше конца 🙂")
+            return
+
+        if (end_date - start_date).days > 366:
+            bot.reply_to(message, "Период слишком длинный — максимум год.")
+            return
+
         state.clear_state(user_id)
         state.set_state(
             user_id,
@@ -363,7 +419,8 @@ def text_message(message):
     # --- Настройка времени напоминания ---
     if stage == "waiting_reminder_time":
         try:
-            hour_str, minute_str = text.split(":")
+            # 21:00 и 21.00 — оба варианта годятся
+            hour_str, minute_str = text.replace(".", ":").split(":")
             hour = int(hour_str)
             minute = int(minute_str)
             if not (0 <= hour < 24 and 0 <= minute < 60):
@@ -382,11 +439,15 @@ def text_message(message):
 
     # --- Ручной ввод дневной цели ---
     if stage == "waiting_manual_goal":
-        if not text.isdigit():
-            bot.reply_to(message, "Напиши цель числом, например: 2200")
+        goal = parse_number(text, 800, 6000)
+
+        if goal is None:
+            bot.reply_to(
+                message, "Напиши цель числом от 800 до 6000 ккал, например: 2200"
+            )
             return
 
-        goal = int(text)
+        goal = round(goal)
         db.set_daily_goal(user_id, goal)
         state.clear_state(user_id)
 
@@ -395,9 +456,9 @@ def text_message(message):
 
     # --- Форма расчёта цели: вес ---
     if stage == "waiting_goal_weight":
-        try:
-            weight = float(text.replace(",", "."))
-        except ValueError:
+        weight = parse_number(text, 20, 400)
+
+        if weight is None:
             bot.reply_to(message, "Напиши вес числом в кг, например: 78.5")
             return
 
@@ -407,9 +468,9 @@ def text_message(message):
 
     # --- Форма расчёта цели: рост ---
     if stage == "waiting_goal_height":
-        try:
-            height = float(text.replace(",", "."))
-        except ValueError:
+        height = parse_number(text, 100, 250)
+
+        if height is None:
             bot.reply_to(message, "Напиши рост числом в см, например: 175")
             return
 
@@ -419,17 +480,29 @@ def text_message(message):
 
     # --- Форма расчёта цели: возраст (дальше — кнопки) ---
     if stage == "waiting_goal_age":
-        if not text.isdigit():
+        age = parse_number(text, 10, 100)
+
+        if age is None:
             bot.reply_to(message, "Напиши возраст числом, например: 27")
             return
 
-        state.set_state(user_id, stage="waiting_goal_gender_button", goal_age=int(text))
+        state.set_state(
+            user_id, stage="waiting_goal_gender_button", goal_age=round(age)
+        )
         bot.reply_to(message, "Какой пол?", reply_markup=keyboards.gender_keyboard())
         return
 
     # --- Обычное число калорий ---
-    if text.isdigit():
+    # isdecimal, а не isdigit: isdigit пропускает «²», на котором int() падает
+    if text.isdecimal():
         calories = int(text)
+
+        if not (1 <= calories <= 5000):
+            bot.reply_to(
+                message,
+                "Похоже на опечатку 🤔 За один раз можно записать от 1 до 5000 ккал.",
+            )
+            return
 
         db.add_meal(user_id, "Ручная запись", calories)
 
@@ -468,6 +541,24 @@ def text_message(message):
 # =========================
 # НАЖАТИЯ НА КНОПКИ
 # =========================
+
+
+def show_meal_detail(call, user_id, meal_id, header=""):
+    """Карточка записи из истории. Если запись уже удалена — возвращаемся к списку."""
+    meal = db.get_meal_by_id(meal_id, user_id)
+
+    if meal is None:
+        bot.answer_callback_query(call.id, "Запись не найдена (возможно, уже удалена)")
+        show_history_list(call.message.chat.id, user_id, call.message.message_id)
+        return
+
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        header + format_meal_detail(meal),
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboards.history_item_keyboard(meal_id),
+    )
 
 
 def estimate_portion(call, user_id, current_state):
@@ -545,7 +636,11 @@ def handle_callback(call):
         explicit_meal_type = current_state.get("explicit_meal_type")
 
         if result is None:
-            bot.answer_callback_query(call.id, "Что-то пошло не так, попробуй заново")
+            # Состояние потерялось (перезапуск) или кнопку нажали второй раз
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                STATE_LOST_TEXT, call.message.chat.id, call.message.message_id
+            )
             return
 
         description = build_description(result)
@@ -593,21 +688,8 @@ def handle_callback(call):
 
     elif data.startswith("histopen_"):
         meal_id = int(data.split("_")[1])
-        meal = db.get_meal_by_id(meal_id, user_id)
-
-        if meal is None:
-            bot.answer_callback_query(
-                call.id, "Запись не найдена (возможно, уже удалена)"
-            )
-            show_history_list(call.message.chat.id, user_id, call.message.message_id)
-            return
-
-        bot.edit_message_text(
-            format_meal_detail(meal),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.history_item_keyboard(meal_id),
-        )
+        show_meal_detail(call, user_id, meal_id)
+        return
 
     elif data.startswith("histtype_"):
         meal_id = int(data.split("_")[1])
@@ -620,28 +702,19 @@ def handle_callback(call):
 
     elif data.startswith("histback_"):
         meal_id = int(data.split("_")[1])
-        meal = db.get_meal_by_id(meal_id, user_id)
-        bot.edit_message_text(
-            format_meal_detail(meal),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.history_item_keyboard(meal_id),
-        )
+        show_meal_detail(call, user_id, meal_id)
+        return
 
     elif data.startswith("settype_"):
         _, meal_id_str, code = data.split("_")
         meal_id = int(meal_id_str)
         new_type = db.MEAL_TYPE_CODES.get(code)
 
-        db.update_meal_type(meal_id, user_id, new_type)
-        meal = db.get_meal_by_id(meal_id, user_id)
+        if new_type is not None:
+            db.update_meal_type(meal_id, user_id, new_type)
 
-        bot.edit_message_text(
-            "✅ Обновлено!\n\n" + format_meal_detail(meal),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboards.history_item_keyboard(meal_id),
-        )
+        show_meal_detail(call, user_id, meal_id, header="✅ Обновлено!\n\n")
+        return
 
     elif data.startswith("histdel_"):
         meal_id = int(data.split("_")[1])
@@ -655,7 +728,7 @@ def handle_callback(call):
 
     elif data == "reportperiod_week":
         state.clear_state(user_id)
-        today_date = datetime.now().date()
+        today_date = clock.now().date()
         start = today_date - timedelta(days=6)
         state.set_state(
             user_id,
@@ -672,7 +745,7 @@ def handle_callback(call):
 
     elif data == "reportperiod_month":
         state.clear_state(user_id)
-        today_date = datetime.now().date()
+        today_date = clock.now().date()
         start = today_date - timedelta(days=29)
         state.set_state(
             user_id,
@@ -696,6 +769,14 @@ def handle_callback(call):
             call.message.message_id,
         )
 
+    elif data.startswith("reportformat_") and not current_state.get("report_start"):
+        # Период потерялся (например, бот перезапускался)
+        bot.edit_message_text(
+            "Я забыл выбранный период 🤷 Открой 📈 Отчёт ещё раз.",
+            call.message.chat.id,
+            call.message.message_id,
+        )
+
     elif data == "reportformat_text":
         start = current_state.get("report_start")
         end = current_state.get("report_end")
@@ -715,17 +796,16 @@ def handle_callback(call):
             "📈 Строю график...", call.message.chat.id, call.message.message_id
         )
 
-        image_path = reports.build_image_report(user_id, start, end)
+        image = reports.build_image_report(user_id, start, end)
         state.clear_state(user_id)
 
-        if image_path is None:
+        if image is None:
             bot.send_message(
                 call.message.chat.id,
                 "За этот период записей нет — картинку строить не из чего.",
             )
         else:
-            with open(image_path, "rb") as photo:
-                bot.send_photo(call.message.chat.id, photo)
+            bot.send_photo(call.message.chat.id, image)
 
     # --- Настройки ---
 
@@ -848,6 +928,6 @@ bot.set_my_commands(
 
 reminders.start_reminders(bot)
 
-print("Бот запущен!")
+logger.info("Бот запущен! Часовой пояс: %s", clock.TIMEZONE)
 
 bot.infinity_polling(skip_pending=True)

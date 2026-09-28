@@ -1,10 +1,13 @@
 import os
 import json
+import logging
 
 import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -117,6 +120,13 @@ def analyze_food(food_text, grams_text=None):
             messages=[{"role": "user", "content": user_message}],
         )
     except anthropic.AnthropicError as error:
+        logger.warning("LLM недоступен: %s: %s", type(error).__name__, error)
         raise LLMUnavailableError(str(error)) from error
 
-    return _parse_result(response.content[0].text)
+    raw_text = response.content[0].text
+    result = _parse_result(raw_text)
+
+    if result is None:
+        logger.info("Не удалось разобрать ответ LLM: %r", raw_text[:500])
+
+    return result

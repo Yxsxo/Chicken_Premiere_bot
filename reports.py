@@ -1,9 +1,7 @@
+import io
 from datetime import datetime
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 
 import db
 import formatting
@@ -37,6 +35,8 @@ def build_text_report(user_id, start_date, end_date):
 
 
 def build_image_report(user_id, start_date, end_date):
+    """График в памяти (BytesIO) — без общего файла на диске,
+    чтобы два одновременных отчёта не перезаписали друг друга."""
     data = db.get_calories_by_day(user_id, start_date, end_date)
 
     if not data:
@@ -50,16 +50,19 @@ def build_image_report(user_id, start_date, end_date):
         f"{formatting.format_date_ddmmyyyy(end_date)}"
     )
 
-    plt.figure(figsize=(8, 4))
-    plt.bar(dates, calories, color="#4CAF50")
-    plt.title(f"Калории: {period_label}")
-    plt.xlabel("Дата")
-    plt.ylabel("Ккал")
-    plt.xticks(rotation=45)
-    plt.tight_layout()
+    # Figure напрямую, без pyplot: pyplot хранит «текущий график» глобально
+    # и не рассчитан на работу из нескольких потоков
+    figure = Figure(figsize=(8, 4))
+    axes = figure.subplots()
+    axes.bar(dates, calories, color="#4CAF50")
+    axes.set_title(f"Калории: {period_label}")
+    axes.set_xlabel("Дата")
+    axes.set_ylabel("Ккал")
+    axes.tick_params(axis="x", rotation=45)
+    figure.tight_layout()
 
-    path = "report.png"
-    plt.savefig(path)
-    plt.close()
+    image = io.BytesIO()
+    figure.savefig(image, format="png")
+    image.seek(0)
 
-    return path
+    return image
